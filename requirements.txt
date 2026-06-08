@@ -1,5 +1,10 @@
+# Market data
 yfinance>=0.2.40
+
+# Data processing
 pandas>=2.0.0
 numpy>=1.26.0
+
+# CLI & display
 rich>=13.0.0
 typer>=0.12.0
