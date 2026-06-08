@@ -1,0 +1,2 @@
+[console_scripts]
+stockmonitor = stockmonitor.cli:main

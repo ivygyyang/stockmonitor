@@ -13,6 +13,7 @@ setup(
         "numpy>=1.26.0",
         "rich>=13.0.0",
         "typer>=0.12.0",
+        "scikit-learn>=1.4.0",
     ],
     entry_points={
         "console_scripts": [

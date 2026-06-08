@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: stockmonitor
+Version: 0.3.0
+Summary: CLI tool that scans stocks for breakout signals, grades its own predictions, and self-improves over time
+Home-page: https://github.com/ivygyyang/stockmonitor
+Author: ivygyyang
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Office/Business :: Financial :: Investment
+Requires-Python: >=3.11
+Requires-Dist: yfinance>=0.2.40
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: typer>=0.12.0
+Requires-Dist: scikit-learn>=1.4.0
+Dynamic: author
+Dynamic: classifier
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
