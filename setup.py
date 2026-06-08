@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="stockmonitor",
-    version="0.2.0",
-    description="CLI tool that scans stocks for breakout, spike, and pullback signals — with daily logging, next-day grading, and self-tuning thresholds",
+    version="0.3.0",
+    description="CLI tool that scans stocks for breakout signals, grades its own predictions, and self-improves over time",
     author="ivygyyang",
     url="https://github.com/ivygyyang/stockmonitor",
     packages=find_packages(),

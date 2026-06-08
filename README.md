@@ -1,6 +1,6 @@
 # stockmonitor
 
-A CLI tool that scans stocks for variance patterns that may precede breakouts, spikes, or pullbacks. Uses [yfinance](https://github.com/ranaroussi/yfinance) for market data, scores each ticker across multiple technical indicators, explains results in plain English, and learns from its own predictions over time.
+A CLI tool that scans stocks for variance patterns that may precede breakouts, spikes, or pullbacks. Uses [yfinance](https://github.com/ranaroussi/yfinance) for market data, scores each ticker across multiple technical indicators, explains results in plain English, and **learns from its own predictions over time**.
 
 ## Features
 
@@ -9,8 +9,9 @@ A CLI tool that scans stocks for variance patterns that may precede breakouts, s
 - **Watchlist management** — persistent per-user watchlist stored at `~/.stockmonitor/watchlist.json`
 - **Daily prediction logging** — save each day's signals as a timestamped snapshot
 - **Next-day grading** — compare yesterday's predictions against actual price moves
-- **Self-tuning thresholds** — automatically adjusts RSI, volume, and other thresholds based on historical accuracy
-- **Accuracy tracking** — see how well each signal type has performed over time
+- **Self-improvement journal** — every grade writes structured improvement directives to a running journal
+- **Auto-tuning thresholds** — RSI, volume, and other thresholds adjust automatically based on hit rate
+- **Scheduled automation** — one command sets up Windows Task Scheduler to run everything daily
 - **Rich output** — color-coded terminal table with bullish (green) / bearish (red) signal bias
 - **CSV export** — save scan results for further analysis
 
@@ -29,45 +30,36 @@ pip install -e .
 ### Scan
 
 ```bash
-# Scan your saved watchlist
-stockmonitor scan
-
-# Scan specific tickers
-stockmonitor scan AAPL TSLA NVDA MSFT
-
-# Show only tickers with at least one active signal
-stockmonitor scan --alerts-only
-
-# Only show high-conviction setups (absolute score ≥ 3)
-stockmonitor scan --min-score 3
-
-# Export results to CSV
-stockmonitor scan -o results.csv
-
-# Table only — skip the plain-English explanation
-stockmonitor scan --no-eli5
-
-# Customize thresholds
-stockmonitor scan --rsi-oversold 30 --rsi-overbought 70 --vol-spike 2.5
+stockmonitor scan                          # scan watchlist with ELI5 explanation
+stockmonitor scan AAPL TSLA NVDA           # scan specific tickers
+stockmonitor scan --alerts-only            # only show tickers with active signals
+stockmonitor scan --min-score 3            # high-conviction setups only
+stockmonitor scan --no-eli5               # table only
+stockmonitor scan -o results.csv           # export to CSV
 ```
 
-### Daily Prediction Log & Self-Improvement
+### Daily Self-Improvement Loop
 
 ```bash
-# Save today's predictions to disk
+# 1. Save today's predictions
 stockmonitor log
 
-# Next day: grade yesterday's predictions against actual price moves
+# 2. Next day: grade predictions + auto-update journal + auto-tune thresholds
 stockmonitor grade
 
-# See full historical accuracy + current auto-tuned thresholds
+# 3. Read accumulated improvement notes
+stockmonitor journal
+
+# 4. See overall accuracy stats
 stockmonitor accuracy
+
+# 5. Automate everything (runs once — sets up Windows Task Scheduler)
+stockmonitor schedule
 ```
 
-**Recommended daily workflow:**
-1. Run `stockmonitor log` each morning (or automate it)
-2. Run `stockmonitor grade` the next morning — it scores each prediction and auto-adjusts thresholds
-3. After ~2 weeks of data, run `stockmonitor accuracy` to see which signals are most reliable
+After running `schedule`, the tool will:
+- **6:30 AM daily** — save predictions automatically
+- **9:00 AM daily** — grade them, update the journal, and tune thresholds
 
 ### Watchlist
 
@@ -77,9 +69,25 @@ stockmonitor watch add GOOG
 stockmonitor watch remove SPY
 ```
 
-## Signals & Scoring
+## The Self-Improvement Loop
 
-Each ticker is scored across the following indicators. Positive score = bullish bias, negative = bearish bias.
+Every time `stockmonitor grade` runs, the tool:
+
+1. Fetches actual next-day prices for all predicted tickers
+2. Scores each prediction correct/incorrect
+3. Runs the **Advisor** — a full analysis across all graded history:
+   - Per-signal accuracy (is RSI oversold reliable? is BB squeeze predictive?)
+   - Per-ticker accuracy (which tickers is the model good/bad at?)
+   - Signal combination accuracy (does RSI + volume spike together outperform each alone?)
+   - Trend analysis (is accuracy improving or degrading recently?)
+4. Writes two types of directives into the grade file and journal:
+   - **AUTO** — applied immediately (threshold tightening/relaxing)
+   - **MANUAL** — insights requiring a developer to update the scoring logic
+5. Appends a full entry to `~/.stockmonitor/journal.md`
+
+Run `stockmonitor journal` to read the accumulated notes. The journal grows smarter over time.
+
+## Signals & Scoring
 
 | Signal | Condition | Score |
 |--------|-----------|-------|
@@ -95,31 +103,22 @@ Each ticker is scored across the following indicators. Positive score = bullish 
 | Gap | Gap down ≤ −1.5% | −1 |
 | ATR | ATR% ≥ 3% | flagged (elevated volatility) |
 
-## Self-Tuning
-
-After grading at least 10 predictions, the tool automatically adjusts its thresholds:
-
-- If a signal's hit rate drops below **48%**, the threshold tightens (e.g. RSI oversold moves from 35 → 33)
-- If a signal's hit rate exceeds **65%**, the threshold relaxes slightly to catch more setups
-- Adjusted thresholds are saved to `~/.stockmonitor/config.json` and used on all future scans
-- Run `stockmonitor accuracy` to see current thresholds and per-signal performance
-
 ## Data Storage
 
 All data is stored locally in `~/.stockmonitor/`:
 
 | Path | Contents |
 |------|----------|
-| `watchlist.json` | Your saved tickers |
+| `watchlist.json` | Saved tickers |
 | `config.json` | Auto-tuned threshold settings |
 | `logs/YYYY-MM-DD.json` | Daily prediction snapshots |
-| `grades/YYYY-MM-DD.json` | Graded accuracy results |
+| `grades/YYYY-MM-DD.json` | Graded results + self-improvement directives |
+| `journal.md` | Cumulative improvement journal |
 
 ## Options Reference
 
 ```
 stockmonitor scan [OPTIONS] [TICKERS]...
-
   --period TEXT         yfinance period (1mo, 3mo, 6mo, 1y) [default: 6mo]
   --rsi-oversold INT    RSI oversold threshold              [default: 35]
   --rsi-overbought INT  RSI overbought threshold            [default: 65]
@@ -131,16 +130,14 @@ stockmonitor scan [OPTIONS] [TICKERS]...
   --no-eli5             Skip plain-English explanation
   --output, -o PATH     Export results to CSV
 
-stockmonitor log [TICKERS]...
-
-  --period TEXT         yfinance period string             [default: 6mo]
-
+stockmonitor log [TICKERS]...     Save today's predictions
 stockmonitor grade [PREDICT_DATE] [ACTUAL_DATE]
-
   --no-auto-tune        Skip threshold adjustment after grading
-
-stockmonitor accuracy   Show historical hit rate and current thresholds
-stockmonitor watch      add | remove | list
+stockmonitor journal [-n N]       View last N journal entries (default: 5)
+  --path                Print journal file path
+stockmonitor accuracy             Show historical hit rate + current thresholds
+stockmonitor schedule             Set up Windows Task Scheduler for daily automation
+stockmonitor watch add|remove|list
 ```
 
 ## Dependencies

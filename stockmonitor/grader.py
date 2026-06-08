@@ -88,12 +88,20 @@ def grade_day(predict_date: date, actual_date: date | None = None) -> dict | Non
             }
         )
 
+    # Import here to avoid circular imports at module load
+    from . import advisor as _advisor
+    from . import journal as _journal
+
+    directives = _advisor.generate_directives(actual_date)
+
     grade_record = {
         "predict_date": predict_date.isoformat(),
         "actual_date": actual_date.isoformat(),
         "results": results,
+        "self_improvement": directives,
     }
     _grade_path(predict_date).write_text(json.dumps(grade_record, indent=2))
+    _journal.append_entry(directives)
     return grade_record
 
 

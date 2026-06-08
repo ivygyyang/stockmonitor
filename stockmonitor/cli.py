@@ -11,7 +11,7 @@ from rich.table import Table
 from rich import box
 
 from datetime import date, timedelta
-from . import scanner, watchlist, eli5, logger, grader, tuner
+from . import scanner, watchlist, eli5, logger, grader, tuner, journal
 
 app = typer.Typer(
     name="stockmonitor",
@@ -259,6 +259,101 @@ def accuracy():
     console.print(f"  RSI oversold  : {cfg.get('rsi_oversold', 35)}")
     console.print(f"  RSI overbought: {cfg.get('rsi_overbought', 65)}")
     console.print(f"  Volume spike  : {cfg.get('vol_spike_ratio', 2.0)}x\n")
+
+
+@app.command()
+def journal_cmd(
+    last: int = typer.Option(5, "--last", "-n", help="Show last N entries"),
+    path: bool = typer.Option(False, "--path", help="Print journal file path and exit"),
+):
+    """View the self-improvement journal — accumulated insights from graded predictions."""
+    if path:
+        console.print(str(journal.journal_path()))
+        raise typer.Exit()
+    console.print(f"\n[bold underline]Improvement Journal[/bold underline] (last {last} entries)\n")
+    text = journal.read_journal(last_n=last)
+    # Render as plain text — markdown tables look fine in terminal
+    console.print(text)
+
+
+@app.command()
+def schedule():
+    """Set up Windows Task Scheduler to run stockmonitor log + grade automatically each day."""
+    import subprocess, sys, shutil
+
+    sm = shutil.which("stockmonitor")
+    if not sm:
+        console.print("[red]stockmonitor command not found in PATH. Make sure you ran `pip install -e .`[/red]")
+        raise typer.Exit(1)
+
+    # log task: runs at 6:30 AM daily
+    log_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2024-01-01T06:30:00</StartBoundary>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions>
+    <Exec>
+      <Command>{sm}</Command>
+      <Arguments>log</Arguments>
+    </Exec>
+  </Actions>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+</Task>"""
+
+    # grade task: runs at 9:00 AM daily (after market open, after log)
+    grade_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2024-01-01T09:00:00</StartBoundary>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions>
+    <Exec>
+      <Command>{sm}</Command>
+      <Arguments>grade</Arguments>
+    </Exec>
+  </Actions>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+</Task>"""
+
+    import tempfile, os
+    tasks = [
+        ("StockMonitor_DailyLog", log_xml, "6:30 AM"),
+        ("StockMonitor_DailyGrade", grade_xml, "9:00 AM"),
+    ]
+    success = True
+    for name, xml, time_str in tasks:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-16") as f:
+            f.write(xml)
+            tmp = f.name
+        try:
+            result = subprocess.run(
+                ["schtasks", "/Create", "/TN", name, "/XML", tmp, "/F"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                console.print(f"[green]✓ Scheduled '{name}' at {time_str} daily[/green]")
+            else:
+                console.print(f"[red]✗ Failed to schedule '{name}': {result.stderr.strip()}[/red]")
+                success = False
+        finally:
+            os.unlink(tmp)
+
+    if success:
+        console.print("\n[bold]All done.[/bold] stockmonitor will now:")
+        console.print("  • Save predictions every morning at [bold]6:30 AM[/bold]")
+        console.print("  • Grade them and update the journal every morning at [bold]9:00 AM[/bold]")
+        console.print(f"\nView the journal anytime with: [bold]stockmonitor journal[/bold]")
+
+
+# Register journal command under the name "journal"
+app.command(name="journal")(journal_cmd)
 
 
 def main() -> None:
