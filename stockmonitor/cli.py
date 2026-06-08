@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-from . import scanner, watchlist
+from . import scanner, watchlist, eli5
 
 app = typer.Typer(
     name="stockmonitor",
@@ -78,6 +78,7 @@ def scan(
     min_score: int = typer.Option(0, help="Minimum absolute score to display"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Export results to CSV"),
     alerts_only: bool = typer.Option(False, "--alerts-only", "-a", help="Show only tickers with at least one alert"),
+    no_eli5: bool = typer.Option(False, "--no-eli5", help="Skip the plain-English explanation"),
 ):
     """Scan stocks for breakout, spike, and pullback signals."""
     target = [t.upper() for t in tickers] if tickers else watchlist.load()
@@ -105,6 +106,11 @@ def scan(
         raise typer.Exit()
 
     console.print(_build_table(signals))
+
+    if not no_eli5:
+        console.print("\n[bold underline]Plain-English Summary[/bold underline]\n")
+        console.print(eli5.explain_all(signals))
+        console.print()
 
     if output:
         rows = [s.to_dict() for s in signals]
