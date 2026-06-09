@@ -11,7 +11,7 @@ from rich.table import Table
 from rich import box
 
 from datetime import date, timedelta
-from . import scanner, watchlist, eli5, logger, grader, tuner, journal, ml_agent, live_trader
+from . import scanner, watchlist, eli5, logger, grader, tuner, journal, ml_agent, live_trader, portfolio_trader
 
 app = typer.Typer(
     name="stockmonitor",
@@ -597,6 +597,85 @@ def paper_trade_cmd(
         console.print()
 
 
+@app.command(name="live-retrain")
+def live_retrain_cmd(
+    tickers: Optional[list[str]] = typer.Argument(None, help="Tickers to retrain (defaults to all sessions)"),
+    train_start: Optional[str] = typer.Option(None, help="New training start date, e.g. 2000-01-01 (further back = more data)"),
+    train_window: Optional[int] = typer.Option(None, help="New rolling train window in days (252=1yr, 504=2yr, 756=3yr)"),
+    n_estimators: Optional[int] = typer.Option(None, help="New number of trees (more = stronger but slower, try 200-500)"),
+    confidence: Optional[float] = typer.Option(None, help="New confidence threshold (0.0-1.0)"),
+    model: Optional[str] = typer.Option(None, help="Model type: 'rf' (Random Forest) or 'gbm' (Gradient Boosting -- usually more accurate)"),
+):
+    """
+    Upgrade an existing live session's brain without resetting your portfolio.
+
+    Your cash, shares, and trade history are preserved. Only the model is
+    retrained with the new settings.
+
+    Examples:
+      stockmonitor live-retrain AAPL --model gbm          # switch to Gradient Boosting
+      stockmonitor live-retrain AAPL --train-window 504   # use 2 years of history per retrain
+      stockmonitor live-retrain AAPL --n-estimators 300   # more trees = stronger model
+      stockmonitor live-retrain AAPL --train-start 1990-01-01  # feed it more history
+    """
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        console.print("[red]scikit-learn required: pip install scikit-learn[/red]")
+        raise typer.Exit(1)
+
+    if model and model not in live_trader.AVAILABLE_MODELS:
+        console.print(f"[red]Unknown model '{model}'. Choose: {', '.join(live_trader.AVAILABLE_MODELS)}[/red]")
+        raise typer.Exit(1)
+
+    targets = [t.upper() for t in tickers] if tickers else live_trader.list_sessions()
+    if not targets:
+        console.print("[yellow]No active sessions. Run [bold]stockmonitor live-start TICKER[/bold] first.[/yellow]")
+        raise typer.Exit()
+
+    for ticker in targets:
+        console.print(f"\n[bold]{ticker}[/bold] — retraining...", end="")
+        try:
+            state, changes = live_trader.retrain(
+                ticker,
+                train_start=train_start,
+                train_window=train_window,
+                n_estimators=n_estimators,
+                confidence_threshold=confidence,
+                model_type=model,
+            )
+        except FileNotFoundError as e:
+            console.print(f"\n[red]{e}[/red]")
+            continue
+        except ValueError as e:
+            console.print(f"\n[red]Error: {e}[/red]")
+            continue
+
+        console.print(" done\n")
+
+        if changes:
+            console.print("  [bold]Changes applied:[/bold]")
+            labels = {
+                "train_start":  "Training start",
+                "train_window": "Train window (days)",
+                "n_estimators": "Trees",
+                "confidence":   "Confidence threshold",
+                "model_type":   "Model algorithm",
+            }
+            for key, (old, new) in changes.items():
+                console.print(f"    {labels.get(key, key):<22} {old}  ->  [bold]{new}[/bold]")
+        else:
+            console.print("  [dim]No settings changed — model retrained on latest data.[/dim]")
+
+        sig_color = "green" if state.pending_action == "BUY" else ("red" if state.pending_action == "SELL" else "yellow")
+        console.print(
+            f"\n  [bold]New signal:[/bold] [{sig_color}]{state.pending_action}[/{sig_color}] "
+            f"(confidence {state.pending_proba:.1%})"
+        )
+        console.print(f"  Portfolio value unchanged — cash ${state.cash:,.2f}, "
+                      f"shares {state.shares:.4f}")
+
+
 @app.command(name="live-start")
 def live_start_cmd(
     ticker: str = typer.Argument(..., help="Ticker symbol to start trading, e.g. AAPL"),
@@ -605,7 +684,8 @@ def live_start_cmd(
     cash: float = typer.Option(1000.0, help="Starting virtual cash in dollars"),
     train_window: int = typer.Option(252, help="Rolling days used to retrain the model each day"),
     confidence: float = typer.Option(0.55, help="Minimum model confidence (0.0-1.0) required to buy"),
-    n_estimators: int = typer.Option(100, help="Random Forest trees per model"),
+    n_estimators: int = typer.Option(100, help="Number of trees in the model"),
+    model: str = typer.Option("rf", help="Model type: 'rf' (Random Forest) or 'gbm' (Gradient Boosting)"),
 ):
     """
     Train the ML model on historical data and start a live paper-trading session.
@@ -639,6 +719,7 @@ def live_start_cmd(
             starting_cash=cash,
             train_window=train_window,
             n_estimators=n_estimators,
+            model_type=model,
             confidence_threshold=confidence,
         )
     except (ValueError, ImportError) as e:
@@ -849,6 +930,479 @@ def live_check_cmd(
             console.print(f"            {first_d}  ...  {last_d}\n")
 
         console.print()
+
+
+@app.command(name="doctor")
+def doctor_cmd():
+    """Check that everything is set up correctly for live ML paper trading."""
+    from rich.panel import Panel
+    import sys, importlib, socket
+
+    ok = "[bold green]  OK  [/bold green]"
+    fail = "[bold red] FAIL [/bold red]"
+    warn = "[bold yellow] WARN [/bold yellow]"
+    arrow = "[dim]->[/dim]"
+
+    all_good = True
+    steps_needed = []
+
+    console.print()
+    console.rule("[bold] stockmonitor setup check [/bold]")
+    console.print()
+
+    # ── 1. Python version ─────────────────────────────────────────────────────
+    major, minor = sys.version_info.major, sys.version_info.minor
+    if major == 3 and minor >= 11:
+        console.print(f"[{ok}] Python {major}.{minor}  (3.11+ required)")
+    else:
+        console.print(f"[{fail}] Python {major}.{minor}  -- need 3.11 or newer")
+        all_good = False
+        steps_needed.append("Upgrade Python to 3.11+: https://www.python.org/downloads/")
+
+    # ── 2. Required packages ──────────────────────────────────────────────────
+    packages = {
+        "yfinance":    "market data downloads",
+        "pandas":      "data manipulation",
+        "numpy":       "numerical computation",
+        "rich":        "terminal display",
+        "typer":       "CLI framework",
+        "sklearn":     "ML model (Random Forest)",
+    }
+    for pkg, purpose in packages.items():
+        try:
+            mod = importlib.import_module(pkg)
+            ver = getattr(mod, "__version__", "?")
+            console.print(f"[{ok}] {pkg:<12} {ver:<10}  {purpose}")
+        except ImportError:
+            console.print(f"[{fail}] {pkg:<12} NOT INSTALLED  -- {purpose}")
+            all_good = False
+            install_name = "scikit-learn" if pkg == "sklearn" else pkg
+            steps_needed.append(f"pip install {install_name}")
+
+    # ── 3. Internet / Yahoo Finance reachable ─────────────────────────────────
+    console.print()
+    try:
+        socket.setdefaulttimeout(5)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("query1.finance.yahoo.com", 443))
+        console.print(f"[{ok}] Yahoo Finance is reachable (internet connection good)")
+    except OSError:
+        console.print(f"[{fail}] Cannot reach Yahoo Finance -- check your internet connection")
+        all_good = False
+        steps_needed.append("Fix your internet connection -- yfinance needs Yahoo Finance")
+
+    # ── 4. Can actually download a ticker ─────────────────────────────────────
+    try:
+        import yfinance as yf
+        test = yf.download("SPY", period="5d", auto_adjust=True, progress=False)
+        if test.empty:
+            raise ValueError("empty response")
+        console.print(f"[{ok}] yfinance data download works  (tested with SPY, got {len(test)} rows)")
+    except Exception as e:
+        console.print(f"[{fail}] yfinance download failed: {e}")
+        all_good = False
+        steps_needed.append("Check yfinance: pip install --upgrade yfinance")
+
+    # ── 5. sklearn model smoke-test ───────────────────────────────────────────
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+        import numpy as np
+        X = np.random.rand(50, 13)
+        y = (np.random.rand(50) > 0.5).astype(int)
+        clf = RandomForestClassifier(n_estimators=5, random_state=0).fit(X, y)
+        clf.predict(X[:1])
+        console.print(f"[{ok}] scikit-learn Random Forest works  (smoke test passed)")
+    except Exception as e:
+        console.print(f"[{fail}] scikit-learn smoke test failed: {e}")
+        all_good = False
+        steps_needed.append("Reinstall scikit-learn: pip install --upgrade scikit-learn")
+
+    # ── 6. State directory writable ───────────────────────────────────────────
+    console.print()
+    state_dir = live_trader.STATE_DIR
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        test_file = state_dir / ".write_test"
+        test_file.write_text("ok")
+        test_file.unlink()
+        console.print(f"[{ok}] State directory writable: {state_dir}")
+    except Exception as e:
+        console.print(f"[{fail}] Cannot write to {state_dir}: {e}")
+        all_good = False
+        steps_needed.append(f"Fix permissions on {state_dir}")
+
+    # ── 7. Active sessions ────────────────────────────────────────────────────
+    sessions = live_trader.list_sessions()
+    console.print()
+    if sessions:
+        console.print(f"[{ok}] Active live sessions: [bold]{', '.join(sessions)}[/bold]")
+        for ticker in sessions:
+            try:
+                state = live_trader.LiveState.load(ticker)
+                import yfinance as yf
+                raw = yf.download(ticker, period="2d", auto_adjust=True, progress=False)
+                if isinstance(raw.columns, __import__("pandas").MultiIndex):
+                    raw.columns = raw.columns.droplevel(1)
+                price = float(raw["Close"].iloc[-1]) if not raw.empty else 0.0
+                pv = state.current_value(price)
+                ret = (pv - state.starting_cash) / state.starting_cash * 100
+                ret_color = "green" if ret >= 0 else "red"
+                sig_color = "green" if state.pending_action == "BUY" else ("red" if state.pending_action == "SELL" else "yellow")
+                console.print(
+                    f"       [bold]{ticker}[/bold]  started {state.started_on}  "
+                    f"last updated {state.last_updated}  "
+                    f"value [bold][{ret_color}]${pv:,.2f} ({ret:+.1f}%)[/{ret_color}][/bold]  "
+                    f"next signal [{sig_color}]{state.pending_action}[/{sig_color}]"
+                )
+            except Exception:
+                console.print(f"       [yellow]{ticker}: could not load state[/yellow]")
+    else:
+        console.print(f"[{warn}] No live paper-trade sessions found yet")
+        steps_needed.append(
+            'Start one with:  stockmonitor live-start AAPL --train-start 2000-01-01 --cash 1000'
+        )
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    console.print()
+    if all_good and sessions:
+        console.print(Panel(
+            "[bold green]Everything is set up correctly.[/bold green]\n\n"
+            f"You have [bold]{len(sessions)}[/bold] active session(s): [bold]{', '.join(sessions)}[/bold]\n\n"
+            "  [bold]stockmonitor live-update[/bold]   -- advance the simulation (run after market close)\n"
+            "  [bold]stockmonitor live-check[/bold]    -- view your portfolio dashboard",
+            title="[bold green] Ready to trade [/bold green]",
+            border_style="green",
+        ))
+    elif all_good:
+        console.print(Panel(
+            "[bold yellow]All dependencies are installed, but no live session exists yet.[/bold yellow]\n\n"
+            "Start your virtual $1,000 portfolio with:\n\n"
+            "  [bold]stockmonitor live-start AAPL --train-start 2000-01-01 --cash 1000[/bold]\n\n"
+            "Then each day after market close run:\n\n"
+            "  [bold]stockmonitor live-update[/bold]\n\n"
+            "And check your dashboard anytime with:\n\n"
+            "  [bold]stockmonitor live-check[/bold]",
+            title="[bold yellow] Almost ready [/bold yellow]",
+            border_style="yellow",
+        ))
+    else:
+        fixes = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(steps_needed))
+        console.print(Panel(
+            f"[bold red]Setup is incomplete.[/bold red] Fix the following:\n\n{fixes}",
+            title="[bold red] Action required [/bold red]",
+            border_style="red",
+        ))
+
+    console.print()
+
+
+@app.command(name="portfolio-start")
+def portfolio_start_cmd(
+    tickers: Optional[list[str]] = typer.Argument(None, help="Tickers to trade (defaults to watchlist)"),
+    cash: float = typer.Option(1000.0, help="Total virtual cash shared across all stocks"),
+    train_start: str = typer.Option("2000-01-01", help="Start of training history (YYYY-MM-DD)"),
+    train_window: int = typer.Option(252, help="Rolling days used to retrain each model"),
+    n_estimators: int = typer.Option(100, help="Number of trees per model"),
+    model: str = typer.Option("rf", help="Model: 'rf' (Random Forest) or 'gbm' (Gradient Boosting)"),
+    confidence: float = typer.Option(0.55, help="Min confidence to open a position"),
+    max_positions: int = typer.Option(3, help="Max stocks held at once (cash divided equally between them)"),
+):
+    """
+    Start a shared $1,000 portfolio traded across multiple stocks by the ML model.
+
+    The model scores every ticker each day and:
+      - SELLS any held stock it predicts will fall
+      - BUYS the top-confidence rising stocks with free cash (up to max-positions at once)
+    """
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        console.print("[red]scikit-learn required: pip install scikit-learn[/red]")
+        raise typer.Exit(1)
+
+    if portfolio_trader.PortfolioState.exists():
+        console.print("[yellow]A portfolio session already exists.[/yellow]")
+        console.print("  Run [bold]stockmonitor portfolio-check[/bold] to view it.")
+        console.print(f"  Delete [bold]{portfolio_trader.STATE_PATH}[/bold] to reset.")
+        raise typer.Exit()
+
+    target = [t.upper() for t in tickers] if tickers else watchlist.load()
+    console.print(f"\n[bold]Starting portfolio paper trade[/bold]")
+    console.print(f"  Tickers    : {', '.join(target)}")
+    console.print(f"  Total cash : ${cash:,.2f} shared  |  Max positions: {max_positions}")
+    console.print(f"  Model      : {model.upper()}  |  Confidence: {confidence:.0%}  |  Train window: {train_window}d\n")
+    console.print("  Fetching starting prices...\n")
+
+    state, price_lines = portfolio_trader.start(
+        tickers=target,
+        starting_cash=cash,
+        train_start=train_start,
+        train_window=train_window,
+        n_estimators=n_estimators,
+        model_type=model,
+        confidence_threshold=confidence,
+        max_positions=max_positions,
+    )
+    for line in price_lines:
+        console.print(line)
+
+    console.print(f"\n  [green]Portfolio session saved.[/green]")
+    console.print(f"  State file: {portfolio_trader.STATE_PATH}\n")
+    console.print("  [bold]Next steps:[/bold]")
+    console.print("    [bold]stockmonitor portfolio-update[/bold]   -- run after market close each day")
+    console.print("    [bold]stockmonitor portfolio-check[/bold]    -- view dashboard anytime")
+    console.print("    [bold]stockmonitor schedule-live[/bold]      -- auto-schedule daily updates\n")
+
+
+@app.command(name="portfolio-update")
+def portfolio_update_cmd():
+    """
+    Fetch today's prices, sell falling positions, buy top signals with free cash.
+    Run this once per day after market close (4:00 PM ET).
+    """
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        console.print("[red]scikit-learn required: pip install scikit-learn[/red]")
+        raise typer.Exit(1)
+
+    if not portfolio_trader.PortfolioState.exists():
+        console.print("[yellow]No portfolio found. Run [bold]stockmonitor portfolio-start[/bold] first.[/yellow]")
+        raise typer.Exit()
+
+    console.print(f"\n[bold]Portfolio update — {date.today()}[/bold]")
+    console.print("  Fetching prices and running models...\n")
+
+    state, log = portfolio_trader.update()
+    for line in log:
+        console.print(line)
+
+    if state.daily_values:
+        pv = state.daily_values[-1][1]
+        ret = (pv - state.starting_cash) / state.starting_cash * 100
+        color = "green" if ret >= 0 else "red"
+        console.print(f"\n  Portfolio value: [{color}][bold]${pv:,.2f}  ({ret:+.1f}%)[/bold][/{color}]")
+    console.print()
+
+
+@app.command(name="portfolio-check")
+def portfolio_check_cmd(
+    chart_height: int = typer.Option(10, help="Chart height in rows"),
+    chart_width: int = typer.Option(70, help="Chart width in columns"),
+    last_trades: int = typer.Option(15, help="Recent trades to show (0 = all)"),
+):
+    """Dashboard: portfolio value, positions, P&L vs buy-and-hold, trade log, chart."""
+    if not portfolio_trader.PortfolioState.exists():
+        console.print("[yellow]No portfolio found. Run [bold]stockmonitor portfolio-start[/bold] first.[/yellow]")
+        raise typer.Exit()
+
+    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich.text import Text
+
+    console.print("  Loading prices...", end="\r")
+    state, prices = portfolio_trader.get_status()
+
+    pv = state.total_value(prices)
+    bh = state.bh_value(prices)
+    total_ret = (pv - state.starting_cash) / state.starting_cash * 100
+    bh_ret = (bh - state.starting_cash) / state.starting_cash * 100
+    diff = total_ret - bh_ret
+    days = (date.today() - date.fromisoformat(state.started_on)).days
+
+    pv_color = "green" if total_ret >= 0 else "red"
+    bh_color = "green" if bh_ret >= 0 else "red"
+    beat_color = "green" if diff > 0 else "red"
+
+    console.print()
+    console.rule("[bold] Portfolio Dashboard [/bold]")
+    console.print()
+
+    left = Text()
+    left.append(f"  Started       : {state.started_on}\n")
+    left.append(f"  Last updated  : {state.last_updated}\n")
+    left.append(f"  Running       : {days} days\n")
+    left.append(f"  Model         : {state.model_type.upper()}  |  "
+                f"Confidence: {state.confidence_threshold:.0%}\n")
+    left.append(f"  Max positions : {state.max_positions}\n")
+    left.append(f"  Tickers       : {', '.join(state.tickers)}\n")
+
+    right = Text()
+    right.append(f"  Starting cash : ${state.starting_cash:,.2f}\n")
+    right.append(f"  Cash on hand  : ${state.cash:,.2f}\n")
+    right.append(f"  Portfolio now : ", style="bold")
+    right.append(f"${pv:,.2f}  ({total_ret:+.1f}%)\n", style=pv_color)
+    right.append(f"  Buy-and-hold  : ", style="bold")
+    right.append(f"${bh:,.2f}  ({bh_ret:+.1f}%)\n", style=bh_color)
+    right.append(f"  vs B&H        : ", style="bold")
+    right.append(f"{diff:+.1f}%\n", style=beat_color)
+
+    console.print(Columns([left, right], equal=True))
+
+    # ── Open positions ────────────────────────────────────────────────────────
+    if state.positions:
+        console.print(f"\n[bold]Open Positions[/bold]")
+        pos_table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+        for col in ["Ticker", "Shares", "Buy Price", "Now", "Value", "P&L", "P&L %"]:
+            pos_table.add_column(col, justify="right" if col != "Ticker" else "left")
+        for ticker, pos in state.positions.items():
+            now = prices.get(ticker, pos.buy_price)
+            val = pos.shares * now
+            pnl = val - (pos.shares * pos.buy_price)
+            pnl_pct = pnl / (pos.shares * pos.buy_price) * 100
+            color = "green" if pnl >= 0 else "red"
+            pos_table.add_row(
+                f"[bold]{ticker}[/bold]",
+                f"{pos.shares:.4f}",
+                f"${pos.buy_price:,.2f}",
+                f"${now:,.2f}",
+                f"${val:,.2f}",
+                f"[{color}]${pnl:+,.2f}[/{color}]",
+                f"[{color}]{pnl_pct:+.1f}%[/{color}]",
+            )
+        console.print(pos_table)
+    else:
+        console.print("\n  [dim]No open positions — all cash.[/dim]")
+
+    # ── Trade log ─────────────────────────────────────────────────────────────
+    trades_to_show = state.trades if last_trades == 0 else state.trades[-last_trades:]
+    if trades_to_show:
+        console.print(f"\n[bold]Recent Trades[/bold] (last {len(trades_to_show)} of {len(state.trades)})")
+        t_table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+        for col in ["Date", "Ticker", "Action", "Price", "Shares", "Value", "P&L"]:
+            t_table.add_column(col, justify="right" if col not in ("Date", "Ticker", "Action") else "left")
+        for tr in trades_to_show:
+            color = "green" if tr.action == "BUY" else "red"
+            pnl_str = f"${tr.pnl:+,.2f}" if tr.action == "SELL" else "-"
+            pnl_color = "green" if tr.pnl >= 0 else "red"
+            t_table.add_row(
+                tr.date, f"[bold]{tr.ticker}[/bold]",
+                f"[{color}][bold]{tr.action}[/bold][/{color}]",
+                f"${tr.price:,.2f}", f"{tr.shares:.4f}",
+                f"${tr.value:,.2f}",
+                f"[{pnl_color}]{pnl_str}[/{pnl_color}]",
+            )
+        console.print(t_table)
+
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    if state.daily_values:
+        vals = [v for _, v in state.daily_values] + [pv]
+        dates_c = [d for d, _ in state.daily_values] + [str(date.today())]
+        min_v, max_v = min(vals), max(vals)
+        v_range = max_v - min_v if max_v != min_v else 1.0
+        step_c = max(1, len(vals) // chart_width)
+        sv = vals[::step_c][:chart_width]
+        sd = dates_c[::step_c][:chart_width]
+        grid = [[" "] * len(sv) for _ in range(chart_height)]
+        for ci, v in enumerate(sv):
+            ri = chart_height - 1 - int((v - min_v) / v_range * (chart_height - 1))
+            grid[max(0, min(chart_height - 1, ri))][ci] = "+" if v >= state.starting_cash else "-"
+        console.print(f"\n[bold]Portfolio Value Chart[/bold]  (+ above ${state.starting_cash:,.0f} start)")
+        for ri, row in enumerate(grid):
+            label = max_v - (ri / max(chart_height - 1, 1)) * v_range
+            rich_line = "".join(
+                "[green]+[/green]" if c == "+" else ("[red]-[/red]" if c == "-" else " ")
+                for c in row
+            )
+            console.print(f"  ${label:>8,.0f} |{rich_line}")
+        console.print(f"           +{'-' * len(sv)}")
+        console.print(f"            {sd[0]}  ...  {sd[-1]}\n")
+
+
+@app.command(name="schedule-live")
+def schedule_live_cmd(
+    open_time: str = typer.Option("09:35", help="Time to run morning check (HH:MM, 24h, your local time)"),
+    close_time: str = typer.Option("16:15", help="Time to run after market close (HH:MM, 24h, your local time)"),
+    portfolio: bool = typer.Option(True, help="Schedule portfolio-update"),
+    live: bool = typer.Option(True, help="Schedule live-update for individual sessions"),
+):
+    """
+    Set up Windows Task Scheduler to auto-run updates at market open and close.
+
+    Schedules weekday-only tasks (Mon-Fri). Default times assume you are in
+    Eastern Time (ET). Adjust --open-time / --close-time if you are in a
+    different timezone:
+      ET  -> open 09:35  close 16:15  (default)
+      CT  -> open 08:35  close 15:15
+      MT  -> open 07:35  close 14:15
+      PT  -> open 06:35  close 13:15
+    """
+    import subprocess, shutil, tempfile, os
+
+    sm = shutil.which("stockmonitor")
+    if not sm:
+        # Try known install path
+        candidate = Path.home() / "AppData/Local/Programs/Python/Python313/Scripts/stockmonitor.exe"
+        if candidate.exists():
+            sm = str(candidate)
+        else:
+            console.print("[red]stockmonitor not found in PATH.[/red]")
+            console.print("Make sure you ran [bold]pip install -e .[/bold] and the Scripts folder is on PATH.")
+            raise typer.Exit(1)
+
+    def make_xml(command_args: str, time_str: str) -> str:
+        h, m = time_str.split(":")
+        return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2024-01-01T{h}:{m}:00</StartBoundary>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <Monday/><Tuesday/><Wednesday/><Thursday/><Friday/>
+        </DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions>
+    <Exec>
+      <Command>{sm}</Command>
+      <Arguments>{command_args}</Arguments>
+    </Exec>
+  </Actions>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+  </Settings>
+</Task>"""
+
+    tasks = []
+    if portfolio and portfolio_trader.PortfolioState.exists():
+        tasks.append(("StockMonitor_Portfolio_Close", "portfolio-update", close_time))
+    if live and live_trader.list_sessions():
+        tasks.append(("StockMonitor_Live_Close", "live-update", close_time))
+
+    if not tasks:
+        console.print("[yellow]Nothing to schedule — start a session first:[/yellow]")
+        console.print("  [bold]stockmonitor portfolio-start[/bold]   -- shared $1,000 across all stocks")
+        console.print("  [bold]stockmonitor live-start AAPL[/bold]   -- single-stock session")
+        raise typer.Exit()
+
+    console.print(f"\n[bold]Setting up Windows Task Scheduler[/bold]")
+    console.print(f"  Market close update : {close_time} (weekdays only)\n")
+
+    success = True
+    for name, args, time_str in tasks:
+        xml = make_xml(args, time_str)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-16") as f:
+            f.write(xml)
+            tmp = f.name
+        try:
+            result = subprocess.run(
+                ["schtasks", "/Create", "/TN", name, "/XML", tmp, "/F"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                console.print(f"  [green]Scheduled '{name}' at {time_str} Mon-Fri[/green]")
+            else:
+                console.print(f"  [red]Failed '{name}': {result.stderr.strip()}[/red]")
+                success = False
+        finally:
+            os.unlink(tmp)
+
+    if success:
+        console.print(f"\n[bold]Done.[/bold] stockmonitor will now update automatically after market close.")
+        console.print(f"  Run [bold]stockmonitor portfolio-check[/bold] or [bold]stockmonitor live-check[/bold] anytime to see results.\n")
 
 
 # Register journal command under the name "journal"

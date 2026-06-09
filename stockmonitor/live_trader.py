@@ -29,11 +29,28 @@ from .indicators import atr, bollinger_bands, macd, rsi, volume_ratio, gap_pct
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 FEATURE_NAMES = [
-    "rsi", "macd_line", "macd_hist", "bb_pct_b", "bb_width",
-    "atr_pct", "vol_ratio", "gap_pct",
+    # Momentum
+    "rsi", "rsi_slope",
+    "macd_line", "macd_hist", "macd_slope",
+    # Volatility / bands
+    "bb_pct_b", "bb_width", "atr_pct", "atr_slope",
+    # Volume
+    "vol_ratio", "vol_ratio_5d",
+    # Gap
+    "gap_pct",
+    # Short-term returns
     "ret_1d", "ret_3d", "ret_5d",
-    "close_vs_sma20", "close_vs_sma50",
+    # Medium-term returns
+    "ret_10d", "ret_20d", "ret_60d",
+    # Trend
+    "close_vs_sma20", "close_vs_sma50", "close_vs_sma200",
+    "sma20_vs_sma50",
+    # Volatility regime
+    "vol_regime",      # rolling 10d std / rolling 60d std  (>1 = expanding vol)
+    "up_days_10",      # fraction of up days in last 10
 ]
+
+AVAILABLE_MODELS = ("rf", "gbm")   # random forest | gradient boosting
 
 STATE_DIR = Path.home() / ".stockmonitor" / "live"
 
@@ -42,29 +59,68 @@ STATE_DIR = Path.home() / ".stockmonitor" / "live"
 
 def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     feat = pd.DataFrame(index=df.index)
-    feat["rsi"] = rsi(df)
+    close = df["Close"]
+
+    # Momentum
+    rsi_s = rsi(df)
+    feat["rsi"] = rsi_s
+    feat["rsi_slope"] = rsi_s.diff(3)           # RSI trending up or down
+
     ml_line, _, hist = macd(df)
     feat["macd_line"] = ml_line
     feat["macd_hist"] = hist
+    feat["macd_slope"] = ml_line.diff(3)
+
+    # Volatility / bands
     _, _, _, width, pct_b = bollinger_bands(df)
     feat["bb_pct_b"] = pct_b
     feat["bb_width"] = width
     atr_s = atr(df)
-    feat["atr_pct"] = atr_s / df["Close"] * 100
-    feat["vol_ratio"] = volume_ratio(df)
+    atr_pct = atr_s / close * 100
+    feat["atr_pct"] = atr_pct
+    feat["atr_slope"] = atr_pct.diff(5)         # volatility expanding or contracting
+
+    # Volume
+    vr = volume_ratio(df)
+    feat["vol_ratio"] = vr
+    feat["vol_ratio_5d"] = df["Volume"].rolling(5).mean() / df["Volume"].rolling(20).mean()
+
+    # Gap
     feat["gap_pct"] = gap_pct(df)
-    close = df["Close"]
+
+    # Short-term returns
     feat["ret_1d"] = close.pct_change(1) * 100
     feat["ret_3d"] = close.pct_change(3) * 100
     feat["ret_5d"] = close.pct_change(5) * 100
-    feat["close_vs_sma20"] = (close / close.rolling(20).mean() - 1) * 100
-    feat["close_vs_sma50"] = (close / close.rolling(50).mean() - 1) * 100
+
+    # Medium-term returns (new)
+    feat["ret_10d"] = close.pct_change(10) * 100
+    feat["ret_20d"] = close.pct_change(20) * 100
+    feat["ret_60d"] = close.pct_change(60) * 100
+
+    # Trend
+    sma20  = close.rolling(20).mean()
+    sma50  = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    feat["close_vs_sma20"]  = (close / sma20  - 1) * 100
+    feat["close_vs_sma50"]  = (close / sma50  - 1) * 100
+    feat["close_vs_sma200"] = (close / sma200 - 1) * 100
+    feat["sma20_vs_sma50"]  = (sma20 / sma50  - 1) * 100  # golden/death cross proximity
+
+    # Volatility regime: short-term vol vs long-term vol
+    std10 = close.pct_change().rolling(10).std()
+    std60 = close.pct_change().rolling(60).std()
+    feat["vol_regime"] = std10 / std60.replace(0, np.nan)
+
+    # Fraction of up-days in last 10 sessions
+    feat["up_days_10"] = (close.diff() > 0).rolling(10).mean()
+
     feat["label"] = (close.shift(-1) > close).astype(int)
     return feat.dropna()
 
 
-def _train_model(feat_df: pd.DataFrame, train_window: int, n_estimators: int):
-    from sklearn.ensemble import RandomForestClassifier
+def _train_model(feat_df: pd.DataFrame, train_window: int, n_estimators: int,
+                 model_type: str = "rf"):
     from sklearn.preprocessing import StandardScaler
 
     X = feat_df[FEATURE_NAMES].values[-train_window:]
@@ -75,13 +131,27 @@ def _train_model(feat_df: pd.DataFrame, train_window: int, n_estimators: int):
 
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X)
-    clf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=6,
-        min_samples_leaf=10,
-        random_state=42,
-        n_jobs=-1,
-    )
+
+    if model_type == "gbm":
+        from sklearn.ensemble import GradientBoostingClassifier
+        clf = GradientBoostingClassifier(
+            n_estimators=n_estimators,
+            max_depth=4,
+            learning_rate=0.05,
+            min_samples_leaf=10,
+            subsample=0.8,
+            random_state=42,
+        )
+    else:
+        from sklearn.ensemble import RandomForestClassifier
+        clf = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=6,
+            min_samples_leaf=10,
+            random_state=42,
+            n_jobs=-1,
+        )
+
     clf.fit(X_s, y)
     return clf, scaler
 
@@ -121,6 +191,7 @@ class LiveState:
     confidence_threshold: float
     train_window: int
     n_estimators: int
+    model_type: str = "rf"   # "rf" or "gbm"
     trades: list[TradeRecord] = field(default_factory=list)
     daily_values: list[tuple[str, float]] = field(default_factory=list)
     # buy-and-hold reference
@@ -169,6 +240,7 @@ def start(
     train_window: int = 252,
     n_estimators: int = 100,
     confidence_threshold: float = 0.55,
+    model_type: str = "rf",
 ) -> LiveState:
     """
     Download history, train model, record initial state, make first prediction.
@@ -189,7 +261,7 @@ def start(
         raise ValueError(f"Not enough data for {ticker} ({len(raw)} rows, need {train_window + 60})")
 
     feat_df = _build_features(raw)
-    clf, scaler = _train_model(feat_df, train_window, n_estimators)
+    clf, scaler = _train_model(feat_df, train_window, n_estimators, model_type)
     if clf is None:
         raise ValueError("Training failed — only one class in training window.")
 
@@ -220,6 +292,7 @@ def start(
         confidence_threshold=confidence_threshold,
         train_window=train_window,
         n_estimators=n_estimators,
+        model_type=model_type,
         bh_shares=starting_cash / last_price,
         bh_start_price=last_price,
     )
@@ -282,7 +355,8 @@ def update(ticker: str) -> tuple[LiveState, str, float]:
 
     # ── Retrain and predict next action ──────────────────────────────────────
     feat_df = _build_features(raw)
-    clf, scaler = _train_model(feat_df, state.train_window, state.n_estimators)
+    clf, scaler = _train_model(feat_df, state.train_window, state.n_estimators,
+                               getattr(state, "model_type", "rf"))
     if clf is not None:
         last_row = feat_df[FEATURE_NAMES].values[-1]
         pred, proba_up = _predict(clf, scaler, last_row)
@@ -300,6 +374,68 @@ def update(ticker: str) -> tuple[LiveState, str, float]:
     state.last_updated = latest_date
     state.save()
     return state, executed, latest_price
+
+
+def retrain(
+    ticker: str,
+    train_start: Optional[str] = None,
+    train_window: Optional[int] = None,
+    n_estimators: Optional[int] = None,
+    confidence_threshold: Optional[float] = None,
+    model_type: Optional[str] = None,
+) -> tuple[LiveState, dict]:
+    """
+    Retrain an existing session's model with new settings without resetting
+    the portfolio. Portfolio history, trades, cash, and shares are preserved.
+    Returns (updated_state, changes_dict) where changes_dict describes what changed.
+    """
+    state = LiveState.load(ticker)
+    changes = {}
+
+    if train_start and train_start != state.train_start:
+        changes["train_start"] = (state.train_start, train_start)
+        state.train_start = train_start
+    if train_window and train_window != state.train_window:
+        changes["train_window"] = (state.train_window, train_window)
+        state.train_window = train_window
+    if n_estimators and n_estimators != state.n_estimators:
+        changes["n_estimators"] = (state.n_estimators, n_estimators)
+        state.n_estimators = n_estimators
+    if confidence_threshold and confidence_threshold != state.confidence_threshold:
+        changes["confidence"] = (state.confidence_threshold, confidence_threshold)
+        state.confidence_threshold = confidence_threshold
+    if model_type and model_type != getattr(state, "model_type", "rf"):
+        changes["model_type"] = (getattr(state, "model_type", "rf"), model_type)
+        state.model_type = model_type
+
+    # Re-download full history with potentially new train_start
+    raw = yf.download(state.ticker, start=state.train_start,
+                      auto_adjust=True, progress=False)
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.droplevel(1)
+    if raw.empty or len(raw) < state.train_window + 60:
+        raise ValueError(f"Not enough data for new settings ({len(raw)} rows)")
+
+    feat_df = _build_features(raw)
+    clf, scaler = _train_model(feat_df, state.train_window, state.n_estimators,
+                               getattr(state, "model_type", "rf"))
+    if clf is None:
+        raise ValueError("Retraining failed — only one class in window.")
+
+    last_row = feat_df[FEATURE_NAMES].values[-1]
+    pred, proba_up = _predict(clf, scaler, last_row)
+
+    if pred == 1 and proba_up >= state.confidence_threshold:
+        state.pending_action = "BUY"
+    elif pred == 0:
+        state.pending_action = "SELL"
+    else:
+        state.pending_action = "HOLD"
+    state.pending_proba = proba_up
+    state.train_end = str(raw.index[-1].date())
+
+    state.save()
+    return state, changes
 
 
 def get_status(ticker: str) -> tuple[LiveState, float]:

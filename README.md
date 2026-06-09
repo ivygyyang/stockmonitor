@@ -1,12 +1,12 @@
 # stockmonitor
 
-A CLI tool that scans stocks for variance patterns that may precede breakouts, spikes, or pullbacks. Uses [yfinance](https://github.com/ranaroussi/yfinance) for market data, scores each ticker across multiple technical indicators, explains results in plain English, **learns from its own predictions over time**, and includes a walk-forward ML backtesting engine and live paper-trading simulator.
+A CLI tool that scans stocks for variance patterns that may precede breakouts, spikes, or pullbacks. Uses [yfinance](https://github.com/ranaroussi/yfinance) for market data, scores each ticker across multiple technical indicators, explains results in plain English, **learns from its own predictions over time**, and includes a walk-forward ML backtesting engine, live paper-trading simulator, and a multi-stock virtual portfolio powered by machine learning.
 
 ## Authors
 
-- **Robert Lewis** — architecture, ML pipeline, backtesting engine
-- **Ivy Lewis** — CLI design, indicator scoring, self-improvement loop
-- **Richie Friedland** ([RichieJr1111](https://github.com/RichieJr1111)) — contributor
+- **Richie Friedland** ([RichieJr1111](https://github.com/RichieJr1111)) — ML engine, walk-forward backtesting, live paper trading, portfolio simulator, observation space design, model architecture (Random Forest & Gradient Boosting), feature engineering
+- **Robert Lewis** — architecture, CLI framework, scheduling, setup
+- **Ivy Lewis** — indicator scoring, self-improvement loop, ELI5 summaries, watchlist
 
 ## Features
 
